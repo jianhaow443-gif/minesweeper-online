@@ -2,7 +2,7 @@
 
 一个可以直接在浏览器里玩的扫雷，支持**两个人一起扫同一块雷区**。纯静态页面，不需要后端，棋盘数据点对点直传。
 
-在线玩：https://brianjov.github.io/minesweeper-online/
+在线玩：https://jianhaow443-gif.github.io/minesweeper-online/
 
 ## 玩法
 
