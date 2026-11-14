@@ -562,6 +562,9 @@
   const pendingCells = new Set();
   let netStat = { rtt: null, route: '' };
   let pingTimer = null;
+  let sigTimer = null;        // 信令连接看门狗
+  let wantJoin = false;       // 当前处于「加入别人房间」的流程
+  let joinAttempts = 0;
 
   const idx = (r, c) => r * G.cols + c;
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -1221,6 +1224,9 @@
 
   function destroyPeer() {
     stopNetProbe();
+    stopSigWatch();
+    wantJoin = false;
+    joinAttempts = 0;
     if (conn) { try { conn.close(); } catch (e) {} conn = null; }
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     netLive = false;
@@ -1230,6 +1236,8 @@
   function hookConn(c) {
     conn = c;
     conn.on('open', () => {
+      wantJoin = false;
+      joinAttempts = 0;
       if (isHost) {
         codeHintEl.textContent = '队友已连接 ✓';
         codeHintEl.className = 'code-hint ok';
@@ -1246,6 +1254,21 @@
     conn.on('data', onData);
     conn.on('close', onPeerGone);
     conn.on('error', () => {});
+
+    // 打洞失败的判定：ICE 直接 failed，说明两边网络不通，重试也没用
+    const pc = c.peerConnection;
+    if (pc && pc.addEventListener) {
+      let everOk = false;
+      pc.addEventListener('iceconnectionstatechange', () => {
+        const st = pc.iceConnectionState;
+        if (st === 'connected' || st === 'completed') everOk = true;
+        if (st === 'failed' && !netLive && !everOk) {
+          wantJoin = false;
+          lobbyMsgSet('连上了房主，但网络通道建不起来（P2P 打洞被挡）。' +
+            '反过来试一次：你建房、让他加入，通常就通了。', 'err');
+        }
+      });
+    }
   }
 
   /* 队友掉线：干净地退回单人，避免出现半边棋盘 */
@@ -1253,6 +1276,7 @@
     if (!netLive) return;
     netLive = false;
     isHost = false;
+    wantJoin = false;
     conn = null;
     stopNetProbe();
     setNetUI();
@@ -1353,13 +1377,48 @@
     p.on('disconnected', () => {
       if (peer && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} }
     });
+    startSigWatch();
     return p;
   }
+
+  /* 信令连接看门狗：浏览器把后台标签页的 WebSocket 掐掉是常事，
+     房主干等的时候连接一死，别人就永远"找不到这个房间"。 */
+  function startSigWatch() {
+    if (sigTimer) return;
+    sigTimer = setInterval(() => {
+      if (!peer || peer.destroyed) return;
+      if (peer.disconnected) {
+        try { peer.reconnect(); } catch (e) {}
+        if (isHost && !conn && !codeBox.hidden) {
+          codeHintEl.textContent = '信令连接断开，正在重连…';
+          codeHintEl.className = 'code-hint err';
+        }
+      } else if (isHost && !conn && !codeBox.hidden) {
+        const t = codeHintEl.textContent;
+        if (/重连/.test(t)) {
+          codeHintEl.textContent = '等待队友加入…（把房间码或邀请链接发给他）';
+          codeHintEl.className = 'code-hint';
+        }
+      }
+    }, 12000);
+  }
+
+  function stopSigWatch() {
+    if (sigTimer) { clearInterval(sigTimer); sigTimer = null; }
+  }
+
+  // 切回前台时立刻检查一次信令，别让后台节流把房间挂死
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (peer && !peer.destroyed && peer.disconnected) {
+      try { peer.reconnect(); } catch (e) {}
+    }
+  });
 
   function onPeerError(err) {
     const type = err && err.type;
     if (type === 'unavailable-id') {
-      const joining = !isHost && roomCode && !netLive;
+      const joining = wantJoin;
       const target = roomCode;
       try { if (peer) peer.destroy(); } catch (e) {}
       peer = null;
@@ -1368,7 +1427,9 @@
       return;
     }
     if (type === 'peer-unavailable') {
-      lobbyMsgSet('找不到这个房间，检查一下房间码？', 'err');
+      // 房主可能刚好在重连信令，重试两次能救回大部分情况
+      if (wantJoin && !netLive) retryJoin(true);
+      else lobbyMsgSet('找不到这个房间，检查一下房间码？', 'err');
     } else if (type === 'network' || type === 'server-error' || type === 'socket-error') {
       if (isHost && !lobbyEl.hidden) {
         codeHintEl.textContent = '信令服务器连不上，请稍后重试';
@@ -1378,6 +1439,24 @@
     } else if (type === 'browser-incompatible') {
       lobbyMsgSet('当前浏览器不支持 WebRTC', 'err');
     }
+  }
+
+  function retryJoin(fromError) {
+    if (!wantJoin || netLive) return;
+    joinAttempts++;
+    if (joinAttempts > 3) {
+      lobbyMsgSet('连不上房主。反过来试一次：你点「创建房间」把码发给他，让他加入 —— 这种单向不通的情况换过来通常就通了。', 'err');
+      wantJoin = false;
+      return;
+    }
+    lobbyMsgSet('没连上' + (fromError ? '（房主可能刚重连）' : '') + '，正在重试 ' + joinAttempts + '/3 …');
+    setTimeout(() => {
+      if (!wantJoin || netLive) return;
+      if (peer && !peer.destroyed && peer.open) doConnect();
+      else if (peer && !peer.destroyed) {
+        peer.once('open', () => { if (wantJoin && !netLive) doConnect(); });
+      }
+    }, 1200);
   }
 
   function createRoom() {
@@ -1426,21 +1505,33 @@
     const p = ensurePeer();          // 复用预热连接，省掉握手等待
 
     isHost = false;
+    wantJoin = true;
+    joinAttempts = 0;
     roomCode = code;                 // 覆盖预热时生成的临时码
     roomCodeEl.textContent = code;
     codeBox.hidden = true;
     lobbyMsgSet('正在连接房主…');
 
-    const go = () => {
-      if (!peer || peer.destroyed) return;
-      const c = peer.connect('sao-' + code, { reliable: true });
-      hookConn(c);
-      setTimeout(() => {
-        if (!netLive) lobbyMsgSet('连接超时。确认房间码正确，且对方还在房间里。', 'err');
-      }, 15000);
-    };
-    if (p.open) go();
-    else p.once('open', go);
+    if (p.open) doConnect();
+    else p.once('open', () => { if (wantJoin && !netLive) doConnect(); });
+  }
+
+  function doConnect() {
+    if (!peer || peer.destroyed || !peer.open) return;
+    if (!wantJoin || netLive) return;
+    const target = roomCode;
+    let c;
+    try {
+      c = peer.connect('sao-' + target, { reliable: true });
+    } catch (e) { retryJoin(false); return; }
+    hookConn(c);
+    setTimeout(() => {
+      if (netLive || !wantJoin) return;
+      if (c && !c.open) {
+        try { c.close(); } catch (e) {}
+        retryJoin(false);
+      }
+    }, 12000);
   }
 
   /* ================= 大厅交互 ================= */
