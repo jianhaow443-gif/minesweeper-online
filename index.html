@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>扫雷 · 双人联机 Minesweeper Co-op</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%A3%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://0.peerjs.com" crossorigin>
+<link rel="dns-prefetch" href="https://0.peerjs.com">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; -webkit-user-select: none; }
 
@@ -210,6 +212,27 @@
     0% { box-shadow: 0 0 0 3px rgba(90,209,156,.85); }
     100% { box-shadow: 0 0 0 3px rgba(90,209,156,0); }
   }
+
+  /* 客机点击后、等服务端确认的瞬间反馈，让手感和本地一样跟手 */
+  .cell.pending {
+    background: var(--cell-hover);
+    box-shadow: inset 0 0 0 2px rgba(124,140,255,.75);
+  }
+
+  .netchip {
+    display: flex; align-items: center; gap: 6px;
+    border-radius: 999px;
+    padding: 4px 11px;
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    border: 1px solid var(--panel-border);
+    background: var(--bg2);
+    color: var(--text-dim);
+  }
+  .netchip[hidden] { display: none; }
+  .netchip.direct { color: var(--ok); border-color: rgba(90,209,156,.4); }
+  .netchip.relay { color: var(--flag); border-color: rgba(255,179,71,.4); }
+  .netchip b { font-weight: 700; }
 
   .mpbar {
     display: flex;
@@ -434,6 +457,7 @@
   <div class="mpbar" id="mpbar" hidden>
     <div class="pchip p1"><span class="pdot"></span>你 <b id="scoreMe">0</b></div>
     <div class="pchip p2"><span class="pdot"></span>队友 <b id="scorePeer">0</b></div>
+    <div class="netchip" id="netChip" hidden></div>
   </div>
 
   <div class="banner" id="banner"></div>
@@ -509,6 +533,7 @@
   const mpbarEl  = document.getElementById('mpbar');
   const scoreMeEl   = document.getElementById('scoreMe');
   const scorePeerEl = document.getElementById('scorePeer');
+  const netChip     = document.getElementById('netChip');
   const netBtn   = document.getElementById('netBtn');
   const netBtnText = document.getElementById('netBtnText');
   const lobbyEl  = document.getElementById('lobby');
@@ -533,6 +558,10 @@
   let roomCode = '';
   let netLive = false;        // 是否已进入联机对局
   let pendingJoinCode = null;
+  let lastSent = null;        // 上一次同步出去的每格状态，用来算增量
+  const pendingCells = new Set();
+  let netStat = { rtt: null, route: '' };
+  let pingTimer = null;
 
   const idx = (r, c) => r * G.cols + c;
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -563,11 +592,11 @@
   function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
   function startTimer() {
     if (timerId) return;
+    // 两端各自本地走表，靠同步消息里的秒数做 max 校正，不再每秒广播一次
     timerId = setInterval(() => {
       if (!G || G.over || !G.placed) return;
       G.sec++;
       timerEl.textContent = G.sec;
-      if (isHost) broadcast();   // host 每秒同步一次，保证两端时钟不漂
     }, 1000);
   }
 
@@ -632,13 +661,23 @@
     el.className = cls;
   }
 
-  function paintAll() {
-    for (let i = 0; i < cellEls.length; i++) paintCell(i);
-    // 用 setProperty 保持列数（换难度时会重建）
+  function updateCounters() {
     mineEl.textContent = Math.max(G.mines - countFlags(), 0);
     timerEl.textContent = G.sec;
     scoreMeEl.textContent = score.me;
     scorePeerEl.textContent = score.peer;
+  }
+
+  function paintAll() {
+    for (let i = 0; i < cellEls.length; i++) paintCell(i);
+    updateCounters();
+  }
+
+  /* 单格状态编码：0=未翻开 1=旗 2+n=已翻开且数字为 n（11=已翻开的雷，仅结算时出现） */
+  function cellState(i) {
+    if (G.rev[i]) return G.mine[i] ? 11 : 2 + G.num[i];
+    if (G.flg[i]) return 1;
+    return 0;
   }
 
   function countFlags() {
@@ -653,6 +692,8 @@
     G = makeGame(diff);
     score = { me: 0, peer: 0 };
     ghostIdx = -1;
+    lastSent = null;
+    pendingCells.clear();
     stopTimer();
     faceEl.textContent = '🙂';
     bannerEl.textContent = '';
@@ -660,6 +701,7 @@
     document.querySelectorAll('.diff button').forEach(b => b.classList.toggle('active', b.dataset.d === diff));
     buildBoard();
     paintAll();
+    markSent();
     showBest(diff, false);
     if (!silent) { /* 无操作 */ }
   }
@@ -867,7 +909,8 @@
     G.boom = typeof s.b === 'number' ? s.b : -1;
     G.sec = s.s || 0;
     G.revealed = countRevealed();
-    if (Array.isArray(s.sc)) { score.me = s.sc[0]; score.peer = s.sc[1]; }
+    // 快照里的 sc 是房主视角（[房主, 客机]），客机要反过来记
+    if (Array.isArray(s.sc)) { score.me = s.sc[1]; score.peer = s.sc[0]; }
 
     currentDiff = G.diff;
     document.querySelectorAll('.diff button').forEach(b => b.classList.toggle('active', b.dataset.d === G.diff));
@@ -881,8 +924,11 @@
     } else {
       bannerEl.className = 'banner';
       bannerEl.textContent = '';
+      if (G.placed) startTimer();
     }
+    pendingCells.clear();
     paintAll();
+    markSent();
   }
 
   function countRevealed() {
@@ -891,20 +937,108 @@
     return n;
   }
 
-  function broadcast() {
+  function send(obj) {
     if (!conn || !conn.open) return;
-    try { conn.send(snapshot()); } catch (e) {}
+    try { conn.send(obj); } catch (e) {}
+  }
+
+  function markSent() {
+    const n = G.rows * G.cols;
+    lastSent = new Uint8Array(n);
+    for (let i = 0; i < n; i++) lastSent[i] = cellState(i);
+  }
+
+  function sendFull() {
+    if (!G) return;
+    markSent();
+    send(snapshot());
+  }
+
+  /* 只把变化的格子发出去；全量快照 1.4KB，一次展开的增量通常只有几十字节 */
+  function flushChanges() {
+    if (!G) return;
+    const n = G.rows * G.cols;
+
+    if (!lastSent || lastSent.length !== n) {
+      paintAll();
+      markSent();
+      if (netLive) sendFull();
+      return;
+    }
+
+    const ch = [];
+    for (let i = 0; i < n; i++) {
+      const st = cellState(i);
+      if (st !== lastSent[i]) { ch.push([i, st]); lastSent[i] = st; }
+    }
+    for (let k = 0; k < ch.length; k++) paintCell(ch[k][0]);
+    updateCounters();
+
+    // 结算必须整盘重绘：没被翻开的雷也要亮出来，这变化不体现在单格状态里
+    if (G.over) {
+      paintAll();
+      if (netLive) sendFull(); else markSent();
+      return;
+    }
+
+    if (!netLive) return;
+    if (!ch.length) return;
+    if (ch.length > 300) { sendFull(); return; }
+    send({ t: 'd', c: ch, s: G.sec, sc: [score.me, score.peer] });
+  }
+
+  /* 客机：只重画变化的格子，不再整盘重绘 */
+  function applyDelta(m) {
+    if (!G) return;
+    const n = G.rows * G.cols;
+    if (Array.isArray(m.c)) {
+      for (let k = 0; k < m.c.length; k++) {
+        const i = m.c[k][0], st = m.c[k][1];
+        if (!(i >= 0 && i < n)) continue;
+        if (st === 0) { G.rev[i] = 0; G.flg[i] = 0; G.num[i] = 0; }
+        else if (st === 1) { G.flg[i] = 1; G.rev[i] = 0; }
+        else if (st === 11) { G.rev[i] = 1; G.mine[i] = 1; }
+        else { G.rev[i] = 1; G.num[i] = st - 2; }
+        paintCell(i);
+      }
+    }
+    if (Array.isArray(m.sc)) { score.me = m.sc[1]; score.peer = m.sc[0]; }
+    if (typeof m.s === 'number' && m.s > G.sec) G.sec = m.s;
+    if (G.placed && !G.over) startTimer();
+    updateCounters();
   }
 
   /* ================= 玩家操作入口 ================= */
+  function markPending(i) {
+    const el = cellEls[i];
+    if (!el || !G || G.rev[i]) return;
+    el.classList.add('pending');
+    pendingCells.add(i);
+    setTimeout(() => {
+      if (pendingCells.delete(i)) {
+        const e2 = cellEls[i];
+        if (e2) e2.classList.remove('pending');
+      }
+    }, 1200);
+  }
+
   function doAct(kind, r, c) {
     if (!G || G.over) return;
+    const i = r * G.cols + c;
 
     if (netLive && !isHost) {
-      // 客机：交给房主裁决，等快照回来再刷新
-      if (conn && conn.open) {
-        try { conn.send({ t: 'act', k: kind, r, c }); } catch (e) {}
+      // 客机：先本地即时反馈（手感跟本地一样），再交给房主裁决；
+      // 房主回来的权威结果会覆盖本地猜测。
+      if (kind === 'f') {
+        if (!G.rev[i]) {
+          G.flg[i] = G.flg[i] ? 0 : 1;
+          paintCell(i);
+          updateCounters();
+        }
+      } else {
+        markPending(i);
       }
+      send({ t: 'act', k: kind, r, c });
       return;
     }
 
@@ -913,10 +1047,7 @@
     else if (kind === 'f') ok = toggleFlag(r, c, false);
     else if (kind === 'c') ok = chord(r, c, false);
 
-    if (ok || kind === 'r') {
-      paintAll();
-      if (netLive) broadcast();
-    }
+    if (ok || kind === 'r') flushChanges();
   }
 
   /* 把队友的动作闪一下，让人看得见对方在干嘛 */
@@ -979,7 +1110,7 @@
 
   faceEl.addEventListener('click', () => {
     if (netLive) {
-      if (isHost) { newGame(currentDiff); broadcast(); }
+      if (isHost) { newGame(currentDiff); sendFull(); }
       else if (conn && conn.open) conn.send({ t: 'restart' });
     } else {
       newGame(currentDiff);
@@ -995,20 +1126,20 @@
         return;
       }
       newGame(d);
-      if (netLive) broadcast();
+      if (netLive) sendFull();
     });
   });
 
-  // 队友光标同步
-  let lastCursorSent = 0;
+  // 队友光标同步：只在跨到新格子时才发，避免刷屏挤占游戏消息
+  let lastCursorIdx = -1;
   boardEl.addEventListener('mousemove', (e) => {
-    if (!netLive || !conn || !conn.open) return;
+    if (!netLive || !conn || !conn.open || !G) return;
     const p = cellFromEvent(e);
     if (!p) return;
-    const now = Date.now();
-    if (now - lastCursorSent < 110) return;
-    lastCursorSent = now;
-    try { conn.send({ t: 'cur', r: p.r, c: p.c }); } catch (err) {}
+    const i = p.r * G.cols + p.c;
+    if (i === lastCursorIdx) return;
+    lastCursorIdx = i;
+    send({ t: 'cur', r: p.r, c: p.c });
   });
 
   window.addEventListener('resize', () => {
@@ -1027,7 +1158,52 @@
       netBtn.classList.remove('live');
       netBtnText.textContent = '联机';
       mpbarEl.hidden = true;
+      netChip.hidden = true;
     }
+  }
+
+  function renderNetChip() {
+    if (!netLive || (!netStat.rtt && !netStat.route)) { netChip.hidden = true; return; }
+    netChip.hidden = false;
+    netChip.className = 'netchip' + (netStat.route ? ' ' + netStat.route : '');
+    const routeText = netStat.route === 'relay' ? '中继' : netStat.route === 'direct' ? '直连' : '';
+    netChip.innerHTML = (routeText ? routeText + ' · ' : '') +
+      (netStat.rtt ? '<b>' + netStat.rtt + '</b> ms' : '检测中');
+  }
+
+  /* 看这条 P2P 到底是直连还是走 TURN 中继 —— 中继是延迟高的头号原因 */
+  async function probeRoute() {
+    try {
+      const pc = conn && conn.peerConnection;
+      if (!pc || !pc.getStats) return;
+      const stats = await pc.getStats();
+      let pair = null;
+      stats.forEach(r => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r;
+      });
+      if (!pair) stats.forEach(r => { if (r.type === 'candidate-pair' && r.state === 'succeeded') pair = r; });
+      let lt = '', rt = '';
+      if (pair) stats.forEach(r => {
+        if (r.type === 'local-candidate' && r.id === pair.localCandidateId) lt = r.candidateType || '';
+        if (r.type === 'remote-candidate' && r.id === pair.remoteCandidateId) rt = r.candidateType || '';
+      });
+      netStat.route = (lt === 'relay' || rt === 'relay') ? 'relay' : (pair ? 'direct' : '');
+      renderNetChip();
+    } catch (e) {}
+  }
+
+  function startNetProbe() {
+    stopNetProbe();
+    send({ t: 'ping', ts: Date.now() });
+    pingTimer = setInterval(() => send({ t: 'ping', ts: Date.now() }), 5000);
+    probeRoute();
+    setTimeout(probeRoute, 3000);
+  }
+
+  function stopNetProbe() {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    netStat = { rtt: null, route: '' };
+    netChip.hidden = true;
   }
 
   function lobbyMsgSet(text, kind) {
@@ -1044,6 +1220,7 @@
   function hasPeerLib() { return typeof window.Peer === 'function'; }
 
   function destroyPeer() {
+    stopNetProbe();
     if (conn) { try { conn.close(); } catch (e) {} conn = null; }
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     netLive = false;
@@ -1057,12 +1234,14 @@
         codeHintEl.textContent = '队友已连接 ✓';
         codeHintEl.className = 'code-hint ok';
         enterNetGame();
-        broadcast();
+        sendFull();
       } else {
         try { conn.send({ t: 'hello' }); } catch (e) {}
         enterNetGame();
         lobbyMsgSet('已连上房主，正在同步棋盘…', 'ok');
       }
+      lastCursorIdx = -1;
+      startNetProbe();
     });
     conn.on('data', onData);
     conn.on('close', onPeerGone);
@@ -1075,6 +1254,7 @@
     netLive = false;
     isHost = false;
     conn = null;
+    stopNetProbe();
     setNetUI();
     stopTimer();
     newGame(currentDiff);
@@ -1102,17 +1282,38 @@
         if (!isHost) applySnapshot(msg);
         break;
 
+      case 'd':
+        if (!isHost) applyDelta(msg);
+        break;
+
       case 'act':
-        if (isHost) {
+        if (isHost && G) {
+          const i = msg.r * G.cols + msg.c;
+          const before = cellState(i);
           let ok = false;
           if (msg.k === 'r') ok = revealAt(msg.r, msg.c, true);
           else if (msg.k === 'f') ok = toggleFlag(msg.r, msg.c, true);
           else if (msg.k === 'c') ok = chord(msg.r, msg.c, true);
+
           if (ok || msg.k === 'r') {
-            paintAll();
-            flashCell(msg.r * G.cols + msg.c);
-            broadcast();
+            flushChanges();              // 只推变化的格子
+            flashCell(i);
           }
+          // 被拒绝了（比如旗子超限）：单发一次权威状态，纠正客机的乐观猜测
+          if (!ok && msg.k !== 'r') {
+            send({ t: 'd', c: [[i, cellState(i)]], s: G.sec, sc: [score.me, score.peer] });
+          }
+        }
+        break;
+
+      case 'ping':
+        send({ t: 'pong', ts: msg.ts });
+        break;
+
+      case 'pong':
+        if (typeof msg.ts === 'number') {
+          netStat.rtt = Math.max(1, Math.round(Date.now() - msg.ts));
+          renderNetChip();
         }
         break;
 
@@ -1123,16 +1324,59 @@
         break;
 
       case 'restart':
-        if (isHost) { newGame(currentDiff); broadcast(); }
+        if (isHost) { newGame(currentDiff); sendFull(); }
         break;
 
       case 'diff':
-        if (isHost && DIFFS[msg.d]) { newGame(msg.d); broadcast(); }
+        if (isHost && DIFFS[msg.d]) { newGame(msg.d); sendFull(); }
         break;
 
       case 'hello':
-        if (isHost) { broadcast(); }
+        if (isHost) { sendFull(); }
         break;
+    }
+  }
+
+  /* 预热一个信令连接：点开大厅那一刻就开始 DNS + TLS + WebSocket 握手，
+     等用户真去建房/进房时连接已经就绪，不用再干等几秒。
+     这个 peer 带自己的 id，所以既能当房主（id 就是房间码），也能直接拿去连别人。 */
+  function ensurePeer() {
+    if (peer && !peer.destroyed) return peer;
+    roomCode = genCode();
+    const p = new Peer('sao-' + roomCode, { config: ICE, debug: 0 });
+    peer = p;
+    p.on('connection', (c) => {
+      if (conn && conn.open) { try { c.close(); } catch (e) {} return; }
+      hookConn(c);
+    });
+    p.on('error', onPeerError);
+    p.on('disconnected', () => {
+      if (peer && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} }
+    });
+    return p;
+  }
+
+  function onPeerError(err) {
+    const type = err && err.type;
+    if (type === 'unavailable-id') {
+      const joining = !isHost && roomCode && !netLive;
+      const target = roomCode;
+      try { if (peer) peer.destroy(); } catch (e) {}
+      peer = null;
+      if (isHost) createRoom();
+      else if (joining) joinRoom(target);
+      return;
+    }
+    if (type === 'peer-unavailable') {
+      lobbyMsgSet('找不到这个房间，检查一下房间码？', 'err');
+    } else if (type === 'network' || type === 'server-error' || type === 'socket-error') {
+      if (isHost && !lobbyEl.hidden) {
+        codeHintEl.textContent = '信令服务器连不上，请稍后重试';
+        codeHintEl.className = 'code-hint err';
+      }
+      lobbyMsgSet('信令服务器连不上，请稍后重试', 'err');
+    } else if (type === 'browser-incompatible') {
+      lobbyMsgSet('当前浏览器不支持 WebRTC', 'err');
     }
   }
 
@@ -1141,58 +1385,36 @@
       lobbyMsgSet('联机库加载失败，请检查网络后刷新页面', 'err');
       return;
     }
-    destroyPeer();
+    if (netLive) destroyPeer();
+    if (conn) { try { conn.close(); } catch (e) {} conn = null; }
+
     isHost = true;
-    roomCode = genCode();
+    const p = ensurePeer();
     codeBox.hidden = false;
     roomCodeEl.textContent = roomCode;
-    codeHintEl.textContent = '正在连接信令服务器…';
-    codeHintEl.className = 'code-hint';
     lobbyMsgSet('');
     newGame(currentDiff);
 
-    peer = new Peer('sao-' + roomCode, { config: ICE, debug: 0 });
-
-    peer.on('open', () => {
-      codeHintEl.textContent = '等待队友加入…';
-      codeHintEl.className = 'code-hint';
-    });
-
-    // 信令服务器连不上时给个明确提示，而不是干等
-    setTimeout(() => {
-      if (!peer || peer.destroyed) return;
-      if (!peer.open) {
-        codeHintEl.textContent = '连不上信令服务器，检查网络后重试';
-        codeHintEl.className = 'code-hint err';
-      } else if (!conn) {
+    const ready = () => {
+      if (!conn) {
         codeHintEl.textContent = '等待队友加入…（把房间码或邀请链接发给他）';
         codeHintEl.className = 'code-hint';
       }
-    }, 12000);
-
-    peer.on('connection', (c) => {
-      if (conn && conn.open) { try { c.close(); } catch (e) {} return; }
-      hookConn(c);
-    });
-
-    peer.on('error', (err) => {
-      const type = err && err.type;
-      if (type === 'unavailable-id') {
-        try { peer.destroy(); } catch (e) {}
-        createRoom();  // 撞码了，换一个
-      } else if (type === 'network' || type === 'server-error' || type === 'socket-error') {
-        codeHintEl.textContent = '信令服务器连不上，请稍后重试';
-        codeHintEl.className = 'code-hint err';
-      } else if (type === 'peer-unavailable') {
-        lobbyMsgSet('房间不存在，或者房主已经离开', 'err');
-      } else if (type === 'browser-incompatible') {
-        lobbyMsgSet('当前浏览器不支持 WebRTC', 'err');
-      }
-    });
-
-    peer.on('disconnected', () => {
-      if (peer && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} }
-    });
+    };
+    if (p.open) ready();
+    else {
+      codeHintEl.textContent = '正在连接信令服务器…';
+      codeHintEl.className = 'code-hint';
+      p.once('open', ready);
+      // 连不上时给个明确提示，而不是干等
+      setTimeout(() => {
+        if (!peer || peer.destroyed) return;
+        if (!peer.open) {
+          codeHintEl.textContent = '连不上信令服务器，检查网络后重试';
+          codeHintEl.className = 'code-hint err';
+        }
+      }, 10000);
+    }
   }
 
   function joinRoom(code) {
@@ -1200,35 +1422,25 @@
     if (code.length !== 6) { lobbyMsgSet('房间码是 6 位字符', 'err'); return; }
     if (!hasPeerLib()) { lobbyMsgSet('联机库加载失败，请检查网络后刷新页面', 'err'); return; }
 
-    destroyPeer();
+    if (netLive) destroyPeer();
+    const p = ensurePeer();          // 复用预热连接，省掉握手等待
+
     isHost = false;
-    roomCode = code;
+    roomCode = code;                 // 覆盖预热时生成的临时码
     roomCodeEl.textContent = code;
     codeBox.hidden = true;
     lobbyMsgSet('正在连接房主…');
 
-    peer = new Peer({ config: ICE, debug: 0 });
-
-    peer.on('open', () => {
+    const go = () => {
+      if (!peer || peer.destroyed) return;
       const c = peer.connect('sao-' + code, { reliable: true });
       hookConn(c);
       setTimeout(() => {
         if (!netLive) lobbyMsgSet('连接超时。确认房间码正确，且对方还在房间里。', 'err');
       }, 15000);
-    });
-
-    peer.on('error', (err) => {
-      const type = err && err.type;
-      if (type === 'peer-unavailable') {
-        lobbyMsgSet('找不到这个房间，检查一下房间码？', 'err');
-      } else if (type === 'network' || type === 'server-error') {
-        lobbyMsgSet('信令服务器连不上，请稍后重试', 'err');
-      } else if (type === 'browser-incompatible') {
-        lobbyMsgSet('当前浏览器不支持 WebRTC', 'err');
-      } else {
-        lobbyMsgSet('连接失败：' + (type || '未知错误'), 'err');
-      }
-    });
+    };
+    if (p.open) go();
+    else p.once('open', go);
   }
 
   /* ================= 大厅交互 ================= */
@@ -1243,6 +1455,8 @@
     } else {
       codeBox.hidden = !isHost;
       document.getElementById('btnCreate').textContent = '创建房间';
+      // 大厅一打开就先握手，等真正建房/进房时连接已就绪
+      if (hasPeerLib()) ensurePeer();
     }
     if (pendingJoinCode) {
       joinInput.value = pendingJoinCode;
