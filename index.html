@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>扫雷 · 双人联机 Minesweeper Co-op</title>
+<title>扫雷 · 最多 4 人联机 Minesweeper Co-op</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%A3%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://0.peerjs.com" crossorigin>
 <link rel="dns-prefetch" href="https://0.peerjs.com">
@@ -205,8 +205,12 @@
     50% { transform: translateX(3px); } 75% { transform: translateX(-2px); }
   }
 
-  /* 队友光标 / 队友操作闪烁 */
-  .cell.ghost { outline: 2px solid var(--ok); outline-offset: -2px; box-shadow: 0 0 12px rgba(90,209,156,.55); }
+  /* 队友光标：每个玩家一种颜色 */
+  .cell.ghost {
+    outline: 2px solid var(--gc, var(--ok));
+    outline-offset: -2px;
+    box-shadow: 0 0 12px var(--gc, rgba(90,209,156,.55));
+  }
   .cell.flash { animation: flash .55s ease; }
   @keyframes flash {
     0% { box-shadow: 0 0 0 3px rgba(90,209,156,.85); }
@@ -238,12 +242,14 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
     margin-top: 12px;
     font-size: 12px;
     color: var(--text-dim);
   }
   .mpbar[hidden] { display: none; }
+  .players { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; justify-content: center; }
   .pchip {
     display: flex; align-items: center; gap: 6px;
     background: var(--bg2);
@@ -251,11 +257,16 @@
     border-radius: 999px;
     padding: 4px 12px;
     font-variant-numeric: tabular-nums;
+    transition: border-color .2s, opacity .2s;
   }
   .pchip b { color: var(--text); font-weight: 700; }
+  .pchip.me { border-color: currentColor; }
+  .pchip.off { opacity: .38; }
   .pdot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-  .pchip.p1 { color: var(--accent); }
-  .pchip.p2 { color: var(--ok); }
+  .pchip.p0 { color: #7c8cff; }
+  .pchip.p1 { color: #5ad19c; }
+  .pchip.p2 { color: #ffb347; }
+  .pchip.p3 { color: #4dd0e1; }
 
   .banner {
     text-align: center;
@@ -430,7 +441,7 @@
 <body>
 <div class="wrap">
   <div class="head">
-    <h1>MINESWEEPER<span>CO-OP · 双人联机</span></h1>
+    <h1>MINESWEEPER<span>CO-OP · 最多 4 人</span></h1>
     <button class="netbtn" id="netBtn"><span class="dot"></span><span id="netBtnText">联机</span></button>
   </div>
 
@@ -455,8 +466,7 @@
   <div class="board-scroll"><div class="board" id="board"></div></div>
 
   <div class="mpbar" id="mpbar" hidden>
-    <div class="pchip p1"><span class="pdot"></span>你 <b id="scoreMe">0</b></div>
-    <div class="pchip p2"><span class="pdot"></span>队友 <b id="scorePeer">0</b></div>
+    <div class="players" id="players"></div>
     <div class="netchip" id="netChip" hidden></div>
   </div>
 
@@ -470,7 +480,7 @@
   <div class="lobby">
     <button class="x" id="lobbyClose">✕</button>
     <h2>一起扫雷</h2>
-    <p class="sub">两个人共用同一块雷区，旗子、计时、胜负全部同步。</p>
+    <p class="sub">最多 4 个人一起扫同一块雷区，旗子、计时、胜负全部实时同步。</p>
 
     <button class="btn primary" id="btnCreate">创建房间</button>
 
@@ -531,8 +541,7 @@
   const bannerEl = document.getElementById('banner');
   const bestEl   = document.getElementById('best');
   const mpbarEl  = document.getElementById('mpbar');
-  const scoreMeEl   = document.getElementById('scoreMe');
-  const scorePeerEl = document.getElementById('scorePeer');
+  const playersEl   = document.getElementById('players');
   const netChip     = document.getElementById('netChip');
   const netBtn   = document.getElementById('netBtn');
   const netBtnText = document.getElementById('netBtnText');
@@ -544,16 +553,21 @@
   const joinInput  = document.getElementById('joinInput');
 
   /* ================= 游戏状态 ================= */
+  const MAXP = 4;                          // 最多 4 人（房主 + 3）
+  const PCOLORS = ['#7c8cff', '#5ad19c', '#ffb347', '#4dd0e1'];
   let G = null;               // 当前棋局
   let cellEls = [];           // 格子 DOM 引用
   let currentDiff = 'easy';
-  let score = { me: 0, peer: 0 };
-  let ghostIdx = -1;          // 队友光标所在格
+  let scores = [0, 0, 0, 0];  // 每个人翻开的格数（全局下标）
+  let myIdx = 0;              // 自己是第几号玩家（房主恒为 0）
+  let ghosts = new Map();     // 玩家序号 -> 光标所在格
+  let roster = [0];           // 在线玩家序号，由房主维护并广播
   let suppressClick = false;  // 长按插旗后抑制 click
 
   // 网络
   let peer = null;
-  let conn = null;
+  let conn = null;            // 客机：到房主的那条连接
+  let hostConns = [];         // 房主：[{c, idx}]，idx 1..3
   let isHost = false;
   let roomCode = '';
   let netLive = false;        // 是否已进入联机对局
@@ -660,15 +674,48 @@
       el.textContent = '';
     }
 
-    if (i === ghostIdx) cls += ' ghost';
+    const gp = ghostMapIdx(i);
+    if (gp >= 0) {
+      cls += ' ghost';
+      el.style.setProperty('--gc', PCOLORS[gp]);
+    } else {
+      el.style.removeProperty('--gc');
+    }
     el.className = cls;
+  }
+
+  /* 这一格被哪个玩家的光标占着（多人重叠时取序号最小的） */
+  function ghostMapIdx(i) {
+    let best = -1;
+    ghosts.forEach((cell, pi) => {
+      if (cell === i && (best < 0 || pi < best)) best = pi;
+    });
+    return best;
+  }
+
+  function repaintGhosts() {
+    for (let i = 0; i < cellEls.length; i++) {
+      if (cellEls[i] && cellEls[i].classList.contains('ghost')) paintCell(i);
+    }
   }
 
   function updateCounters() {
     mineEl.textContent = Math.max(G.mines - countFlags(), 0);
     timerEl.textContent = G.sec;
-    scoreMeEl.textContent = score.me;
-    scorePeerEl.textContent = score.peer;
+    renderPlayers();
+  }
+
+  /* 玩家分数条：只显示在场的人，自己那一格高亮 */
+  function renderPlayers() {
+    if (!netLive) { playersEl.innerHTML = ''; return; }
+    const list = [...new Set(isHost ? rosterNow() : (roster.length ? roster : [0]))].sort((a, b) => a - b);
+    let html = '';
+    for (const pi of list) {
+      const label = pi === myIdx ? '你' : '队友' + (pi + 1);
+      html += `<div class="pchip p${pi}${pi === myIdx ? ' me' : ''}">` +
+        `<span class="pdot"></span>${label} <b>${scores[pi] || 0}</b></div>`;
+    }
+    playersEl.innerHTML = html;
   }
 
   function paintAll() {
@@ -693,8 +740,8 @@
   function newGame(diff, silent) {
     currentDiff = diff;
     G = makeGame(diff);
-    score = { me: 0, peer: 0 };
-    ghostIdx = -1;
+    scores = [0, 0, 0, 0];
+    ghosts.clear();
     lastSent = null;
     pendingCells.clear();
     stopTimer();
@@ -763,11 +810,11 @@
     G.placed = true;
   }
 
-  function addScore(byPeer, n) {
-    if (byPeer) score.peer += n; else score.me += n;
+  function addScore(actor, n) {
+    if (actor >= 0) scores[actor] = (scores[actor] || 0) + n;
   }
 
-  function revealAt(r, c, byPeer) {
+  function revealAt(r, c, actor) {
     if (G.over) return false;
     let i = r * G.cols + c;
     if (G.rev[i] || G.flg[i]) return false;
@@ -781,7 +828,7 @@
       if (G.rev[ai] || G.flg[ai]) continue;
       G.rev[ai] = 1;
       G.revealed++;
-      addScore(byPeer, 1);
+      addScore(actor, 1);
       if (G.mine[ai]) { boomIdx = ai; G.boom = ai; break; }
       if (G.num[ai] === 0) {
         for (const [nr, nc] of neighbors(ar, ac)) {
@@ -795,7 +842,7 @@
     return true;
   }
 
-  function toggleFlag(r, c, byPeer) {
+  function toggleFlag(r, c, actor) {
     if (G.over) return false;
     const i = r * G.cols + c;
     if (G.rev[i]) return false;
@@ -804,7 +851,7 @@
     return true;
   }
 
-  function chord(r, c, byPeer) {
+  function chord(r, c, actor) {
     if (G.over) return false;
     const i = r * G.cols + c;
     if (!G.rev[i] || G.num[i] === 0) return false;
@@ -815,7 +862,7 @@
     for (const [nr, nc] of ns) {
       const ni = nr * G.cols + nc;
       if (!G.flg[ni] && !G.rev[ni]) {
-        revealAt(nr, nc, byPeer);
+        revealAt(nr, nc, actor);
         acted = true;
         if (G.over) return true;
       }
@@ -850,7 +897,7 @@
       if (G.mine[i] && !G.flg[i]) G.flg[i] = 1;
     }
     if (netLive) {
-      bannerEl.textContent = `🎉 一起通关！用时 ${G.sec} 秒 · 你 ${score.me} 格 / 队友 ${score.peer} 格`;
+      bannerEl.textContent = winText();
     } else {
       bannerEl.textContent = `🎉 通关！用时 ${G.sec} 秒`;
       const prev = getBest(currentDiff);
@@ -863,6 +910,14 @@
   }
 
   /* ================= 快照同步 ================= */
+  /* 通关文案：4 人时逐人列出会太长，只报自己 + 全队 */
+  function winText() {
+    const mine = scores[myIdx] || 0;
+    const total = scores.reduce((a, b) => a + b, 0);
+    const who = netLive ? `你 ${mine} 格 · 全队 ${total} 格` : `你 ${mine} 格`;
+    return `🎉 一起通关！用时 ${G.sec} 秒 · ${who}`;
+  }
+
   function snapshot() {
     const n = G.rows * G.cols;
     let v = '', f = '', nn = '', m = '';
@@ -882,12 +937,12 @@
       b: G.boom,
       s: G.sec,
       st: G.placed ? 1 : 0,
-      sc: [score.me, score.peer]
+      sc: scores.slice(),
+      on: rosterNow()
     };
   }
 
-  function applySnapshot(s) {
-    if (!G || G.diff !== s.d) {
+  function applySnapshot(s) {    if (!G || G.diff !== s.d) {
       G = makeGame(s.d);
       buildBoard();
     }
@@ -912,8 +967,9 @@
     G.boom = typeof s.b === 'number' ? s.b : -1;
     G.sec = s.s || 0;
     G.revealed = countRevealed();
-    // 快照里的 sc 是房主视角（[房主, 客机]），客机要反过来记
-    if (Array.isArray(s.sc)) { score.me = s.sc[1]; score.peer = s.sc[0]; }
+    // sc 是全局下标数组，所有人的第 N 项都是同一个玩家
+    if (Array.isArray(s.sc)) { scores = s.sc.slice(0, MAXP); while (scores.length < MAXP) scores.push(0); }
+    if (Array.isArray(s.on)) roster = s.on;
 
     currentDiff = G.diff;
     document.querySelectorAll('.diff button').forEach(b => b.classList.toggle('active', b.dataset.d === G.diff));
@@ -922,7 +978,7 @@
     if (G.over) {
       bannerEl.className = 'banner ' + (G.won ? 'win' : 'lose');
       bannerEl.textContent = G.won
-        ? `🎉 一起通关！用时 ${G.sec} 秒 · 你 ${score.me} 格 / 队友 ${score.peer} 格`
+        ? winText()
         : '💥 踩到雷了！点开心表情重开一局';
     } else {
       bannerEl.className = 'banner';
@@ -940,10 +996,25 @@
     return n;
   }
 
-  function send(obj) {
-    if (!conn || !conn.open) return;
-    try { conn.send(obj); } catch (e) {}
+  /* 房主：广播给所有客机；客机：只发给房主。
+     only = 只发给这条；except = 除这条以外都发 */
+  function netSend(obj, only, except) {
+    if (isHost) {
+      for (const h of hostConns) {
+        if (only && h !== only) continue;
+        if (except && h === except) continue;
+        if (h.c && h.c.open) { try { h.c.send(obj); } catch (e) {} }
+      }
+    } else if (conn && conn.open) {
+      try { conn.send(obj); } catch (e) {}
+    }
   }
+
+  function netAlive() {
+    return isHost ? hostConns.some(h => h.c && h.c.open) : !!(conn && conn.open);
+  }
+
+  function send(obj) { netSend(obj); }
 
   function markSent() {
     const n = G.rows * G.cols;
@@ -951,10 +1022,10 @@
     for (let i = 0; i < n; i++) lastSent[i] = cellState(i);
   }
 
-  function sendFull() {
+  function sendFull(only) {
     if (!G) return;
     markSent();
-    send(snapshot());
+    netSend(snapshot(), only);
   }
 
   /* 只把变化的格子发出去；全量快照 1.4KB，一次展开的增量通常只有几十字节 */
@@ -987,7 +1058,7 @@
     if (!netLive) return;
     if (!ch.length) return;
     if (ch.length > 300) { sendFull(); return; }
-    send({ t: 'd', c: ch, s: G.sec, sc: [score.me, score.peer] });
+    send({ t: 'd', c: ch, s: G.sec, sc: scores.slice() });
   }
 
   /* 客机：只重画变化的格子，不再整盘重绘 */
@@ -1005,7 +1076,8 @@
         paintCell(i);
       }
     }
-    if (Array.isArray(m.sc)) { score.me = m.sc[1]; score.peer = m.sc[0]; }
+    if (Array.isArray(m.sc)) { scores = m.sc.slice(0, MAXP); while (scores.length < MAXP) scores.push(0); }
+    if (Array.isArray(m.on)) roster = m.on;
     if (typeof m.s === 'number' && m.s > G.sec) G.sec = m.s;
     if (G.placed && !G.over) startTimer();
     updateCounters();
@@ -1046,9 +1118,9 @@
     }
 
     let ok = false;
-    if (kind === 'r') ok = revealAt(r, c, false);
-    else if (kind === 'f') ok = toggleFlag(r, c, false);
-    else if (kind === 'c') ok = chord(r, c, false);
+    if (kind === 'r') ok = revealAt(r, c, myIdx);
+    else if (kind === 'f') ok = toggleFlag(r, c, myIdx);
+    else if (kind === 'c') ok = chord(r, c, myIdx);
 
     if (ok || kind === 'r') flushChanges();
   }
@@ -1114,7 +1186,7 @@
   faceEl.addEventListener('click', () => {
     if (netLive) {
       if (isHost) { newGame(currentDiff); sendFull(); }
-      else if (conn && conn.open) conn.send({ t: 'restart' });
+      else if (netAlive()) send({ t: 'restart' });
     } else {
       newGame(currentDiff);
     }
@@ -1124,7 +1196,7 @@
     btn.addEventListener('click', () => {
       const d = btn.dataset.d;
       if (netLive && !isHost) {
-        if (conn && conn.open) conn.send({ t: 'diff', d });
+        if (netAlive()) send({ t: 'diff', d });
         document.querySelectorAll('.diff button').forEach(b => b.classList.toggle('active', b.dataset.d === d));
         return;
       }
@@ -1133,16 +1205,18 @@
     });
   });
 
-  // 队友光标同步：只在跨到新格子时才发，避免刷屏挤占游戏消息
+  // 光标同步：只在跨到新格子时才发，避免刷屏挤占游戏消息
   let lastCursorIdx = -1;
   boardEl.addEventListener('mousemove', (e) => {
-    if (!netLive || !conn || !conn.open || !G) return;
+    if (!netLive || !netAlive() || !G) return;
     const p = cellFromEvent(e);
     if (!p) return;
     const i = p.r * G.cols + p.c;
     if (i === lastCursorIdx) return;
     lastCursorIdx = i;
-    send({ t: 'cur', r: p.r, c: p.c });
+    // 房主的坐标带 p:0，客机的由房主补上序号后转发
+    if (isHost) send({ t: 'cur', p: 0, r: p.r, c: p.c });
+    else send({ t: 'cur', r: p.r, c: p.c });
   });
 
   window.addEventListener('resize', () => {
@@ -1155,8 +1229,10 @@
   function setNetUI() {
     if (netLive) {
       netBtn.classList.add('live');
-      netBtnText.textContent = '房间 ' + roomCode;
+      const n = isHost ? 1 + hostConns.filter(h => h.c && h.c.open).length : roster.length;
+      netBtnText.textContent = '房间 ' + roomCode + ' · ' + n + '/' + MAXP;
       mpbarEl.hidden = false;
+      renderPlayers();
     } else {
       netBtn.classList.remove('live');
       netBtnText.textContent = '联机';
@@ -1177,7 +1253,10 @@
   /* 看这条 P2P 到底是直连还是走 TURN 中继 —— 中继是延迟高的头号原因 */
   async function probeRoute() {
     try {
-      const pc = conn && conn.peerConnection;
+      const active = isHost
+        ? (hostConns.find(h => h.c && h.c.open) || {}).c
+        : conn;
+      const pc = active && active.peerConnection;
       if (!pc || !pc.getStats) return;
       const stats = await pc.getStats();
       let pair = null;
@@ -1227,64 +1306,101 @@
     stopSigWatch();
     wantJoin = false;
     joinAttempts = 0;
+    for (const h of hostConns) { try { h.c.close(); } catch (e) {} }
+    hostConns = [];
     if (conn) { try { conn.close(); } catch (e) {} conn = null; }
     if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
     netLive = false;
+    roster = [0];
+    ghosts.clear();
     setNetUI();
   }
 
-  function hookConn(c) {
+  function rosterNow() {
+    return isHost
+      ? [0].concat(hostConns.filter(h => h.c && h.c.open).map(h => h.idx))
+      : roster.slice();
+  }
+
+  function setGhost(pi, cellIdx) {
+    const prev = ghosts.get(pi);
+    ghosts.set(pi, cellIdx);
+    if (prev !== undefined && prev !== cellIdx && cellEls[prev]) paintCell(prev);
+    if (cellEls[cellIdx]) paintCell(cellIdx);
+  }
+
+  /* ---------- 房主：挂一条客机连接 ---------- */
+  function hookHostConn(c, idx) {
+    const entry = { c, idx };
+    hostConns.push(entry);
+    c.on('open', () => {
+      try { c.send({ t: 'you', i: idx }); } catch (e) {}
+      sendFull(entry);                     // 给新来的人补一份完整棋盘
+      enterNetGame();
+      refreshCodeHint();
+      updateRoster();
+    });
+    c.on('data', (m) => onData(m, entry));
+    c.on('close', () => {
+      const k = hostConns.indexOf(entry);
+      if (k >= 0) hostConns.splice(k, 1);
+      if (ghosts.delete(idx)) repaintGhosts();
+      refreshCodeHint();
+      updateRoster();
+      bannerEl.className = 'banner';
+      bannerEl.textContent = '⚠️ 队友' + (idx + 1) + ' 离开了';
+      setTimeout(() => { if (!G.over) bannerEl.textContent = ''; }, 2500);
+    });
+    c.on('error', () => {});
+    watchIce(c, true);
+  }
+
+  /* ---------- 客机：挂到房主的那条连接 ---------- */
+  function hookGuestConn(c) {
     conn = c;
-    conn.on('open', () => {
+    c.on('open', () => {
       wantJoin = false;
       joinAttempts = 0;
-      if (isHost) {
-        codeHintEl.textContent = '队友已连接 ✓';
-        codeHintEl.className = 'code-hint ok';
-        enterNetGame();
-        sendFull();
-      } else {
-        try { conn.send({ t: 'hello' }); } catch (e) {}
-        enterNetGame();
-        lobbyMsgSet('已连上房主，正在同步棋盘…', 'ok');
-      }
+      try { c.send({ t: 'hello' }); } catch (e) {}
+      enterNetGame();
+      lobbyMsgSet('已连上房主，正在同步棋盘…', 'ok');
       lastCursorIdx = -1;
       startNetProbe();
     });
-    conn.on('data', onData);
-    conn.on('close', onPeerGone);
-    conn.on('error', () => {});
-
-    // 打洞失败的判定：ICE 直接 failed，说明两边网络不通，重试也没用
-    const pc = c.peerConnection;
-    if (pc && pc.addEventListener) {
-      let everOk = false;
-      pc.addEventListener('iceconnectionstatechange', () => {
-        const st = pc.iceConnectionState;
-        if (st === 'connected' || st === 'completed') everOk = true;
-        if (st === 'failed' && !netLive && !everOk) {
-          wantJoin = false;
-          lobbyMsgSet('连上了房主，但网络通道建不起来（P2P 打洞被挡）。' +
-            '反过来试一次：你建房、让他加入，通常就通了。', 'err');
-        }
-      });
-    }
+    c.on('data', (m) => onData(m, null));
+    c.on('close', () => {
+      if (!netLive) return;
+      netLive = false;
+      isHost = false;
+      wantJoin = false;
+      myIdx = 0;
+      conn = null;
+      ghosts.clear();
+      stopNetProbe();
+      setNetUI();
+      stopTimer();
+      newGame(currentDiff);
+      bannerEl.className = 'banner lose';
+      bannerEl.textContent = '⚠️ 房主断开了，已切回单人模式';
+      if (!lobbyEl.hidden) lobbyMsgSet('连接已断开', 'err');
+    });
+    c.on('error', () => {});
+    watchIce(c, false);
   }
 
-  /* 队友掉线：干净地退回单人，避免出现半边棋盘 */
-  function onPeerGone() {
-    if (!netLive) return;
-    netLive = false;
-    isHost = false;
-    wantJoin = false;
-    conn = null;
-    stopNetProbe();
-    setNetUI();
-    stopTimer();
-    newGame(currentDiff);
-    bannerEl.className = 'banner lose';
-    bannerEl.textContent = '⚠️ 队友断开了，已切回单人模式';
-    if (!lobbyEl.hidden) lobbyMsgSet('连接已断开', 'err');
+  function watchIce(c, hostSide) {
+    const pc = c.peerConnection;
+    if (!pc || !pc.addEventListener) return;
+    let everOk = false;
+    pc.addEventListener('iceconnectionstatechange', () => {
+      const st = pc.iceConnectionState;
+      if (st === 'connected' || st === 'completed') everOk = true;
+      if (st === 'failed' && !everOk && !hostSide) {
+        wantJoin = false;
+        lobbyMsgSet('连上了房主，但网络通道建不起来（P2P 打洞被挡）。' +
+          '反过来试一次：你建房、让他加入，通常就通了。', 'err');
+      }
+    });
   }
 
   function enterNetGame() {
@@ -1294,14 +1410,40 @@
     bestEl.textContent = '';
     codeBox.hidden = false;
     roomCodeEl.textContent = roomCode;
-    codeHintEl.textContent = '已连接 ✓';
-    codeHintEl.className = 'code-hint ok';
     document.getElementById('btnCreate').textContent = '断开并回到单人';
+    refreshCodeHint();
   }
 
-  function onData(msg) {
+  function refreshCodeHint() {
+    if (!isHost || codeBox.hidden) return;
+    const n = 1 + hostConns.filter(h => h.c && h.c.open).length;
+    if (n > 1) {
+      codeHintEl.textContent = `已连接 ${n}/${MAXP} 人 ✓${n < MAXP ? '（还能再进 ' + (MAXP - n) + ' 个）' : '（满员）'}`;
+      codeHintEl.className = 'code-hint ok';
+    } else {
+      codeHintEl.textContent = `等待队友加入…（最多 ${MAXP} 人，把房间码或邀请链接发给他们）`;
+      codeHintEl.className = 'code-hint';
+    }
+  }
+
+  /* 房主：有人进出后把名单推给所有人 */
+  function updateRoster() {
+    roster = rosterNow();
+    if (isHost) netSend({ t: 'roster', on: roster });
+    renderPlayers();
+  }
+
+  function onData(msg, src) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.t) {
+      case 'you':
+        if (!isHost && typeof msg.i === 'number') { myIdx = msg.i; renderPlayers(); }
+        break;
+
+      case 'roster':
+        if (!isHost && Array.isArray(msg.on)) { roster = msg.on; renderPlayers(); }
+        break;
+
       case 'state':
         if (!isHost) applySnapshot(msg);
         break;
@@ -1311,13 +1453,13 @@
         break;
 
       case 'act':
-        if (isHost && G) {
+        if (isHost && G && src) {
           const i = msg.r * G.cols + msg.c;
-          const before = cellState(i);
+          const ai = src.idx;
           let ok = false;
-          if (msg.k === 'r') ok = revealAt(msg.r, msg.c, true);
-          else if (msg.k === 'f') ok = toggleFlag(msg.r, msg.c, true);
-          else if (msg.k === 'c') ok = chord(msg.r, msg.c, true);
+          if (msg.k === 'r') ok = revealAt(msg.r, msg.c, ai);
+          else if (msg.k === 'f') ok = toggleFlag(msg.r, msg.c, ai);
+          else if (msg.k === 'c') ok = chord(msg.r, msg.c, ai);
 
           if (ok || msg.k === 'r') {
             flushChanges();              // 只推变化的格子
@@ -1325,13 +1467,14 @@
           }
           // 被拒绝了（比如旗子超限）：单发一次权威状态，纠正客机的乐观猜测
           if (!ok && msg.k !== 'r') {
-            send({ t: 'd', c: [[i, cellState(i)]], s: G.sec, sc: [score.me, score.peer] });
+            netSend({ t: 'd', c: [[i, cellState(i)]], s: G.sec, sc: scores.slice() }, src);
           }
         }
         break;
 
       case 'ping':
-        send({ t: 'pong', ts: msg.ts });
+        if (isHost && src) { try { src.c.send({ t: 'pong', ts: msg.ts }); } catch (e) {} }
+        else send({ t: 'pong', ts: msg.ts });
         break;
 
       case 'pong':
@@ -1342,9 +1485,13 @@
         break;
 
       case 'cur':
-        if (ghostIdx >= 0 && cellEls[ghostIdx]) cellEls[ghostIdx].classList.remove('ghost');
-        ghostIdx = msg.r * G.cols + msg.c;
-        if (cellEls[ghostIdx]) cellEls[ghostIdx].classList.add('ghost');
+        if (isHost && src) {
+          // 房主中转别人的光标，自己那格的渲染由 setGhost 完成
+          netSend({ t: 'cur', p: src.idx, r: msg.r, c: msg.c }, null, src);
+          setGhost(src.idx, msg.r * G.cols + msg.c);
+        } else if (!isHost && G) {
+          setGhost(typeof msg.p === 'number' ? msg.p : 1, msg.r * G.cols + msg.c);
+        }
         break;
 
       case 'restart':
@@ -1356,7 +1503,11 @@
         break;
 
       case 'hello':
-        if (isHost) { sendFull(); }
+        if (isHost && src) {
+          try { src.c.send({ t: 'you', i: src.idx }); } catch (e) {}
+          sendFull(src);
+          updateRoster();
+        }
         break;
     }
   }
@@ -1370,8 +1521,12 @@
     const p = new Peer('sao-' + roomCode, { config: ICE, debug: 0 });
     peer = p;
     p.on('connection', (c) => {
-      if (conn && conn.open) { try { c.close(); } catch (e) {} return; }
-      hookConn(c);
+      if (!isHost) { try { c.close(); } catch (e) {} return; }   // 只有房主接人
+      if (hostConns.length >= MAXP - 1) { try { c.close(); } catch (e) {} return; }
+      const used = new Set(hostConns.map(h => h.idx));
+      let idx = 1;
+      while (used.has(idx) && idx < MAXP) idx++;
+      hookHostConn(c, idx);
     });
     p.on('error', onPeerError);
     p.on('disconnected', () => {
@@ -1465,9 +1620,11 @@
       return;
     }
     if (netLive) destroyPeer();
-    if (conn) { try { conn.close(); } catch (e) {} conn = null; }
+    for (const h of hostConns) { try { h.c.close(); } catch (e) {} }
+    hostConns = [];
 
     isHost = true;
+    myIdx = 0;
     const p = ensurePeer();
     codeBox.hidden = false;
     roomCodeEl.textContent = roomCode;
@@ -1524,7 +1681,7 @@
     try {
       c = peer.connect('sao-' + target, { reliable: true });
     } catch (e) { retryJoin(false); return; }
-    hookConn(c);
+    hookGuestConn(c);
     setTimeout(() => {
       if (netLive || !wantJoin) return;
       if (c && !c.open) {
@@ -1540,8 +1697,7 @@
     if (netLive) {
       codeBox.hidden = false;
       roomCodeEl.textContent = roomCode;
-      codeHintEl.textContent = '已连接 ✓ 把房间码发给朋友';
-      codeHintEl.className = 'code-hint ok';
+      refreshCodeHint();
       document.getElementById('btnCreate').textContent = '断开并回到单人';
     } else {
       codeBox.hidden = !isHost;
